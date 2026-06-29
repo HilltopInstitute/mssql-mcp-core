@@ -3,3 +3,6 @@ dist/
 logs/
 *.tsbuildinfo
 .env
+
+# Local Claude Code harness config (per-repo structural budgets, etc.)
+.claude/
