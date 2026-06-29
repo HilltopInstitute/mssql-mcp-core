@@ -1,5 +1,6 @@
 import sql from "mssql";
 import { Tool } from "@modelcontextprotocol/sdk/types.js";
+import { quoteName, quoteQualified, InvalidIdentifierError } from "../security/sqlIdentifier.js";
 
 export class CreateIndexTool implements Tool {
   [key: string]: any;
@@ -42,10 +43,27 @@ export class CreateIndexTool implements Tool {
       if (isUnique) {
         indexType = `UNIQUE ${indexType}`;
       }
-      const columnNames = columns.join(", ");
+
+      // Quote every identifier; index type is derived from booleans (not user text).
+      let index: string;
+      let target: string;
+      let columnNames: string;
+      try {
+        if (!Array.isArray(columns) || columns.length === 0) {
+          return { success: false, message: "'columns' must be a non-empty array." };
+        }
+        index = quoteName(indexName);
+        target = schemaName ? `${quoteName(schemaName)}.${quoteName(tableName)}` : quoteQualified(tableName);
+        columnNames = columns.map(quoteName).join(", ");
+      } catch (e) {
+        if (e instanceof InvalidIdentifierError) {
+          return { success: false, message: e.message };
+        }
+        throw e;
+      }
 
       const request = new sql.Request(params.pool);
-      const query = `CREATE ${indexType} INDEX ${indexName} ON ${schemaName}.${tableName} (${columnNames})`;
+      const query = `CREATE ${indexType} INDEX ${index} ON ${target} (${columnNames})`;
       await request.query(query);
       
       return {

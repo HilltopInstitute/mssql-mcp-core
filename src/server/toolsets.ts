@@ -255,7 +255,7 @@ export function buildToolRegistry(t: AllTools): ToolRoutingConfig[] {
       name: t.deleteDataTool.name,
       intents: ["data_write"],
       keywords: ["delete", "remove", "purge"],
-      requiredArgs: ["tableName", "whereClause"],
+      requiredArgs: ["tableName", "filters"],
       mutatesData: true,
     },
     {
@@ -263,7 +263,7 @@ export function buildToolRegistry(t: AllTools): ToolRoutingConfig[] {
       name: t.updateDataTool.name,
       intents: ["data_write"],
       keywords: ["update", "modify", "fix"],
-      requiredArgs: ["tableName", "updates", "whereClause"],
+      requiredArgs: ["tableName", "updates", "filters"],
       mutatesData: true,
     },
     {

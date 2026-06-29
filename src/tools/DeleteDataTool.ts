@@ -1,22 +1,39 @@
-import sql from "mssql";
 import { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { createRequest } from "../transactions/TransactionManager.js";
+import { quoteQualified, InvalidIdentifierError } from "../security/sqlIdentifier.js";
+import { buildWhereClause, InvalidFilterError, SUPPORTED_OPERATORS } from "../security/whereFilter.js";
 
 export class DeleteDataTool implements Tool {
   [key: string]: any;
   name = "delete_data";
-  description = "Deletes rows from an MSSQL table with preview and confirmation. Requires WHERE clause for safety.";
-  
+  description =
+    "Deletes rows from an MSSQL table with preview and confirmation. Targets rows via structured, parameterized filters (no raw SQL).";
+
   inputSchema = {
     type: "object",
     properties: {
-      tableName: { 
-        type: "string", 
-        description: "Name of the table to delete from" 
+      tableName: {
+        type: "string",
+        description: "Name of the table to delete from (optionally schema-qualified, e.g. 'dbo.Orders').",
       },
-      whereClause: { 
-        type: "string", 
-        description: "WHERE clause to identify which rows to delete. Example: \"status = 'archived' AND created_date < '2023-01-01'\"" 
+      filters: {
+        type: "array",
+        description:
+          "Structured WHERE conditions (required, non-empty). Each: { column, operator, value }. Values are bound as parameters. Combined with AND unless matchType is 'any'.",
+        items: {
+          type: "object",
+          properties: {
+            column: { type: "string", description: "Column name (validated identifier)." },
+            operator: { type: "string", enum: SUPPORTED_OPERATORS, description: "Comparison operator." },
+            value: { description: "Value to compare (bound as a parameter). Array for IN; omit for IS NULL / IS NOT NULL." },
+          },
+          required: ["column", "operator"],
+        },
+      },
+      matchType: {
+        type: "string",
+        enum: ["all", "any"],
+        description: "Combine conditions with AND ('all', default) or OR ('any').",
       },
       confirmDelete: {
         type: "boolean",
@@ -31,7 +48,7 @@ export class DeleteDataTool implements Tool {
         description: "Optional environment name to target",
       },
     },
-    required: ["tableName", "whereClause"],
+    required: ["tableName", "filters"],
   } as any;
 
   private static readonly MAX_ROWS_DEFAULT = 1000;
@@ -39,29 +56,43 @@ export class DeleteDataTool implements Tool {
   async run(params: any) {
     let query: string | undefined;
     try {
-      const { tableName, whereClause, confirmDelete, maxRows, environment } = params;
-      
-      // Basic validation: ensure whereClause is not empty
-      if (!whereClause || whereClause.trim() === '') {
+      const { tableName, filters, matchType, confirmDelete, maxRows } = params;
+
+      // The free-form whereClause was removed (SQL-injection fix). Guide migration.
+      if (params.whereClause !== undefined) {
         return {
           success: false,
-          message: "WHERE clause is required for safety. Deleting all rows requires explicit WHERE clause like 'WHERE 1=1'.",
-          error: "MISSING_WHERE_CLAUSE",
+          message:
+            "'whereClause' is no longer supported. Use structured 'filters', e.g. filters: [{ column: 'status', operator: '=', value: 'archived' }].",
+          error: "WHERECLAUSE_REMOVED",
         };
+      }
+
+      // Validate identifiers and filters up front, before any query executes.
+      let table: string;
+      const countRequest = createRequest(params);
+      let whereBody: string;
+      try {
+        table = quoteQualified(tableName);
+        whereBody = buildWhereClause(countRequest, filters, matchType ?? "all");
+      } catch (e) {
+        if (e instanceof InvalidIdentifierError || e instanceof InvalidFilterError) {
+          return { success: false, message: e.message, error: "INVALID_REQUEST" };
+        }
+        throw e;
       }
 
       const maxAllowed = maxRows || DeleteDataTool.MAX_ROWS_DEFAULT;
 
       // Step 1: Get count of affected rows
-      const countQuery = `SELECT COUNT(*) as affectedRows FROM ${tableName} WHERE ${whereClause}`;
-      const countRequest = createRequest(params);
+      const countQuery = `SELECT COUNT(*) as affectedRows FROM ${table} WHERE ${whereBody}`;
       const countResult = await countRequest.query(countQuery);
       const affectedRows = countResult.recordset[0].affectedRows;
 
       if (affectedRows === 0) {
         return {
           success: false,
-          message: "No rows match the WHERE clause. No deletion will be performed.",
+          message: "No rows match the filters. No deletion will be performed.",
           error: "NO_ROWS_MATCHED",
           affectedRows: 0,
         };
@@ -70,7 +101,7 @@ export class DeleteDataTool implements Tool {
       if (affectedRows > maxAllowed) {
         return {
           success: false,
-          message: `Delete would affect ${affectedRows} rows, which exceeds the maximum of ${maxAllowed}. Refine your WHERE clause or increase maxRows parameter.`,
+          message: `Delete would affect ${affectedRows} rows, which exceeds the maximum of ${maxAllowed}. Refine your filters or increase maxRows parameter.`,
           error: "TOO_MANY_ROWS",
           affectedRows,
           maxAllowed,
@@ -79,8 +110,9 @@ export class DeleteDataTool implements Tool {
 
       // Step 2: Show preview if not confirmed
       if (!confirmDelete) {
-        const previewQuery = `SELECT TOP 10 * FROM ${tableName} WHERE ${whereClause}`;
         const previewRequest = createRequest(params);
+        const previewWhere = buildWhereClause(previewRequest, filters, matchType ?? "all");
+        const previewQuery = `SELECT TOP 10 * FROM ${table} WHERE ${previewWhere}`;
         const previewResult = await previewRequest.query(previewQuery);
 
         return {
@@ -94,10 +126,11 @@ export class DeleteDataTool implements Tool {
       }
 
       // Step 3: Execute the delete
-      query = `DELETE FROM ${tableName} WHERE ${whereClause}`;
       const request = createRequest(params);
+      const finalWhere = buildWhereClause(request, filters, matchType ?? "all");
+      query = `DELETE FROM ${table} WHERE ${finalWhere}`;
       const result = await request.query(query);
-      
+
       return {
         success: true,
         message: `Successfully deleted ${result.rowsAffected[0]} row(s) from table '${tableName}'`,
@@ -107,7 +140,7 @@ export class DeleteDataTool implements Tool {
       console.error("Error deleting data:", error);
       return {
         success: false,
-        message: `Failed to delete data${query ? ` with '${query}'` : ''}: ${error}`,
+        message: `Failed to delete data${query ? ` with '${query}'` : ""}: ${error}`,
         error: "DELETE_FAILED",
       };
     }

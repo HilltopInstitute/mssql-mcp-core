@@ -1,5 +1,6 @@
 import sql from "mssql";
 import { Tool } from "@modelcontextprotocol/sdk/types.js";
+import { quoteName, quoteQualified, assertSafeTypeSpec, InvalidIdentifierError } from "../security/sqlIdentifier.js";
 
 export class CreateTableTool implements Tool {
   [key: string]: any;
@@ -35,8 +36,20 @@ export class CreateTableTool implements Tool {
       if (!Array.isArray(columns) || columns.length === 0) {
         throw new Error("'columns' must be a non-empty array");
       }
-      const columnDefs = columns.map((col: any) => `[${col.name}] ${col.type}`).join(", ");
-      const query = `CREATE TABLE [${tableName}] (${columnDefs})`;
+      // Quote table and column identifiers; column type is free-form admin DDL but
+      // must not contain statement-breaking sequences.
+      let table: string;
+      let columnDefs: string;
+      try {
+        table = quoteQualified(tableName);
+        columnDefs = columns.map((col: any) => `${quoteName(col.name)} ${assertSafeTypeSpec(col.type)}`).join(", ");
+      } catch (e) {
+        if (e instanceof InvalidIdentifierError) {
+          return { success: false, message: e.message };
+        }
+        throw e;
+      }
+      const query = `CREATE TABLE ${table} (${columnDefs})`;
       await new sql.Request(params.pool).query(query);
       return {
         success: true,

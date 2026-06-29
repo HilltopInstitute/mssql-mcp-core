@@ -66,6 +66,18 @@ export {
 export { TransactionManager, createRequest } from "./transactions/TransactionManager.js";
 export type { ActiveTransaction } from "./transactions/TransactionManager.js";
 
+// ─── Security (identifier quoting + structured filters) ─────────────────────
+export {
+  quoteName,
+  quoteQualified,
+  assertSafeTypeSpec,
+  InvalidIdentifierError,
+  buildWhereClause,
+  InvalidFilterError,
+  SUPPORTED_OPERATORS,
+} from "./security/index.js";
+export type { FilterOperator, FilterCondition, MatchType } from "./security/index.js";
+
 // ─── Shims ──────────────────────────────────────────────────────────────────
 export { initShims } from "./shims.js";
 

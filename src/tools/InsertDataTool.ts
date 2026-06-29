@@ -1,6 +1,6 @@
-import sql from "mssql";
 import { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { createRequest } from "../transactions/TransactionManager.js";
+import { quoteName, quoteQualified, InvalidIdentifierError } from "../security/sqlIdentifier.js";
 export class InsertDataTool implements Tool {
   [key: string]: any;
   name = "insert_data";
@@ -55,7 +55,18 @@ export class InsertDataTool implements Tool {
           };
         }
       }
-      const columns = firstRecordColumns.join(", ");
+      // Validate identifiers up front, before any query executes.
+      let table: string;
+      let columns: string;
+      try {
+        table = quoteQualified(tableName);
+        columns = firstRecordColumns.map(quoteName).join(", ");
+      } catch (e) {
+        if (e instanceof InvalidIdentifierError) {
+          return { success: false, message: e.message, error: "INVALID_REQUEST" };
+        }
+        throw e;
+      }
       const request = createRequest(params);
       if (isMultipleRecords) {
         // Multiple records insert using VALUES clause - works for 1 or more records
@@ -70,7 +81,7 @@ export class InsertDataTool implements Tool {
             request.input(`value${recordIndex}_${columnIndex}`, record[column]);
           });
         });
-        const query = `INSERT INTO ${tableName} (${columns}) VALUES ${valueClauses.join(", ")}`;
+        const query = `INSERT INTO ${table} (${columns}) VALUES ${valueClauses.join(", ")}`;
         await request.query(query);
         return {
           success: true,
@@ -85,7 +96,7 @@ export class InsertDataTool implements Tool {
         firstRecordColumns.forEach((column, index) => {
           request.input(`value${index}`, records[0][column]);
         });
-        const query = `INSERT INTO ${tableName} (${columns}) VALUES (${values})`;
+        const query = `INSERT INTO ${table} (${columns}) VALUES (${values})`;
         await request.query(query);
         return {
           success: true,

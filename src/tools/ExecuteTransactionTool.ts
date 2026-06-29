@@ -1,5 +1,18 @@
 import sql from "mssql";
 import { Tool } from "@modelcontextprotocol/sdk/types.js";
+import { quoteName, quoteQualified, InvalidIdentifierError } from "../security/sqlIdentifier.js";
+import {
+  buildWhereClause,
+  InvalidFilterError,
+  SUPPORTED_OPERATORS,
+  type FilterCondition,
+  type MatchType,
+} from "../security/whereFilter.js";
+
+/** A Request-shaped sink that discards bindings — lets validation run filters before a transaction opens. */
+const NOOP_BINDABLE = { input: (_name: string, _value: unknown) => undefined } as unknown as Parameters<
+  typeof buildWhereClause
+>[0];
 
 interface TransactionOperation {
   type: "insert" | "update" | "delete";
@@ -8,12 +21,10 @@ interface TransactionOperation {
   data?: Record<string, any> | Record<string, any>[];
   /** Required for update */
   updates?: Record<string, any>;
-  /** Required for update and delete */
-  whereClause?: string;
-  /** Confirms update (bypasses preview in batch mode) */
-  confirmUpdate?: boolean;
-  /** Confirms delete (bypasses preview in batch mode) */
-  confirmDelete?: boolean;
+  /** Required for update and delete: structured, parameterized filters */
+  filters?: FilterCondition[];
+  /** Combine filters with AND ('all', default) or OR ('any') */
+  matchType?: MatchType;
 }
 
 export class ExecuteTransactionTool implements Tool {
@@ -52,9 +63,24 @@ export class ExecuteTransactionTool implements Tool {
               type: "object",
               description: "Key-value pairs for update operations.",
             },
-            whereClause: {
+            filters: {
+              type: "array",
+              description:
+                "Structured WHERE conditions for update/delete (required, non-empty). Each: { column, operator, value }. Values are bound as parameters.",
+              items: {
+                type: "object",
+                properties: {
+                  column: { type: "string", description: "Column name (validated identifier)." },
+                  operator: { type: "string", enum: SUPPORTED_OPERATORS, description: "Comparison operator." },
+                  value: { description: "Value to compare (bound as a parameter). Array for IN; omit for IS NULL / IS NOT NULL." },
+                },
+                required: ["column", "operator"],
+              },
+            },
+            matchType: {
               type: "string",
-              description: "WHERE clause for update/delete operations.",
+              enum: ["all", "any"],
+              description: "Combine filters with AND ('all', default) or OR ('any').",
             },
           },
           required: ["type", "tableName"],
@@ -147,6 +173,14 @@ export class ExecuteTransactionTool implements Tool {
         error: "INVALID_OPERATION",
       };
     }
+    // The free-form whereClause was removed (SQL-injection fix). Guide migration.
+    if ((op as any).whereClause !== undefined) {
+      return {
+        success: false,
+        message: `Operation ${index + 1}: 'whereClause' is no longer supported. Use structured 'filters' (e.g. [{ column, operator, value }]).`,
+        error: "WHERECLAUSE_REMOVED",
+      };
+    }
     if (op.type === "insert" && !op.data) {
       return {
         success: false,
@@ -154,20 +188,44 @@ export class ExecuteTransactionTool implements Tool {
         error: "INVALID_OPERATION",
       };
     }
-    if (op.type === "update" && (!op.updates || !op.whereClause)) {
+    const hasFilters = Array.isArray(op.filters) && op.filters.length > 0;
+    if (op.type === "update" && (!op.updates || !hasFilters)) {
       return {
         success: false,
-        message: `Operation ${index + 1}: 'updates' and 'whereClause' are required for update operations.`,
+        message: `Operation ${index + 1}: 'updates' and a non-empty 'filters' array are required for update operations.`,
         error: "INVALID_OPERATION",
       };
     }
-    if (op.type === "delete" && !op.whereClause) {
+    if (op.type === "delete" && !hasFilters) {
       return {
         success: false,
-        message: `Operation ${index + 1}: 'whereClause' is required for delete operations.`,
+        message: `Operation ${index + 1}: a non-empty 'filters' array is required for delete operations.`,
         error: "INVALID_OPERATION",
       };
     }
+
+    // Validate identifiers and filters up front so a bad input fails cleanly (INVALID_REQUEST)
+    // before the transaction opens, instead of throwing mid-transaction and surfacing as
+    // TRANSACTION_FAILED after a wasted round-trip.
+    try {
+      quoteQualified(op.tableName);
+      if (op.type === "insert") {
+        const records = Array.isArray(op.data) ? op.data : [op.data];
+        if (records[0]) Object.keys(records[0]).forEach((k) => quoteName(k));
+      }
+      if (op.type === "update") {
+        Object.keys(op.updates!).forEach((k) => quoteName(k));
+      }
+      if (op.type === "update" || op.type === "delete") {
+        buildWhereClause(NOOP_BINDABLE, op.filters, op.matchType ?? "all");
+      }
+    } catch (e) {
+      if (e instanceof InvalidIdentifierError || e instanceof InvalidFilterError) {
+        return { success: false, message: `Operation ${index + 1}: ${e.message}`, error: "INVALID_REQUEST" };
+      }
+      throw e;
+    }
+
     return null;
   }
 
@@ -206,6 +264,8 @@ export class ExecuteTransactionTool implements Tool {
     }
 
     const columns = Object.keys(records[0]);
+    const table = quoteQualified(op.tableName);
+    const safeColumns = columns.map(quoteName).join(", ");
     const request = transaction.request();
     const valueClauses: string[] = [];
 
@@ -219,7 +279,7 @@ export class ExecuteTransactionTool implements Tool {
       });
     });
 
-    const query = `INSERT INTO ${op.tableName} (${columns.join(", ")}) VALUES ${valueClauses.join(", ")}`;
+    const query = `INSERT INTO ${table} (${safeColumns}) VALUES ${valueClauses.join(", ")}`;
     await request.query(query);
 
     return {
@@ -233,15 +293,17 @@ export class ExecuteTransactionTool implements Tool {
     transaction: sql.Transaction,
     op: TransactionOperation,
   ): Promise<any> {
+    const table = quoteQualified(op.tableName);
     const request = transaction.request();
     const setClause = Object.keys(op.updates!)
       .map((key, index) => {
         request.input(`upd_${index}`, op.updates![key]);
-        return `[${key}] = @upd_${index}`;
+        return `${quoteName(key)} = @upd_${index}`;
       })
       .join(", ");
 
-    const query = `UPDATE ${op.tableName} SET ${setClause} WHERE ${op.whereClause}`;
+    const whereBody = buildWhereClause(request, op.filters, op.matchType ?? "all");
+    const query = `UPDATE ${table} SET ${setClause} WHERE ${whereBody}`;
     const result = await request.query(query);
 
     return {
@@ -255,8 +317,10 @@ export class ExecuteTransactionTool implements Tool {
     transaction: sql.Transaction,
     op: TransactionOperation,
   ): Promise<any> {
+    const table = quoteQualified(op.tableName);
     const request = transaction.request();
-    const query = `DELETE FROM ${op.tableName} WHERE ${op.whereClause}`;
+    const whereBody = buildWhereClause(request, op.filters, op.matchType ?? "all");
+    const query = `DELETE FROM ${table} WHERE ${whereBody}`;
     const result = await request.query(query);
 
     return {
