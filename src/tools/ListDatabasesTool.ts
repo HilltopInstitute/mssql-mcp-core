@@ -2,6 +2,13 @@ import sql from "mssql";
 import { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { getEnvironmentManager } from "../config/EnvironmentManager.js";
 
+/**
+ * Allowed `stateFilter` values. The value is interpolated into the query, so it
+ * MUST be validated against this allowlist at runtime — the inputSchema enum is
+ * not enforced by the MCP layer. (SQL-injection fix; reported by @m10x.)
+ */
+const VALID_STATE_FILTERS = ["ONLINE", "OFFLINE", "RESTORING", "RECOVERING", "SUSPECT", "ALL"] as const;
+
 export class ListDatabasesTool implements Tool {
   [key: string]: any;
   name = "list_databases";
@@ -19,7 +26,7 @@ export class ListDatabasesTool implements Tool {
       },
       stateFilter: {
         type: "string",
-        enum: ["ONLINE", "OFFLINE", "RESTORING", "RECOVERING", "SUSPECT", "ALL"],
+        enum: [...VALID_STATE_FILTERS],
         description: "Filter by database state. Default: ONLINE",
       },
     },
@@ -30,6 +37,16 @@ export class ListDatabasesTool implements Tool {
     const { environment, includeSystemDbs = false, stateFilter = "ONLINE" } = params ?? {};
 
     try {
+      // Validate stateFilter before it reaches the query. The inputSchema enum is advisory only;
+      // a malicious client can send any value, and stateFilter is interpolated into the SQL below.
+      if (!VALID_STATE_FILTERS.includes(stateFilter)) {
+        return {
+          success: false,
+          message: `Invalid stateFilter '${stateFilter}'. Allowed values: ${VALID_STATE_FILTERS.join(", ")}.`,
+          error: "INVALID_PARAMETER",
+        };
+      }
+
       const envManager = await getEnvironmentManager();
       const envConfig = envManager.getEnvironment(environment);
 
