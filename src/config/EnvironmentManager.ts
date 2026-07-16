@@ -20,6 +20,8 @@ export interface EnvironmentConfig {
   password?: string;
   domain?: string;
   trustServerCertificate?: boolean;
+  encrypt?: boolean;
+  hostNameInCertificate?: string;
   connectionTimeout?: number;
   requestTimeout?: number;
 
@@ -168,6 +170,8 @@ export class EnvironmentManager {
       password: process.env.SQL_PASSWORD,
       domain: process.env.SQL_DOMAIN,
       trustServerCertificate: process.env.TRUST_SERVER_CERTIFICATE?.toLowerCase() === "true",
+      encrypt: process.env.SQL_ENCRYPT ? process.env.SQL_ENCRYPT.toLowerCase() === "true" : undefined,
+      hostNameInCertificate: process.env.SQL_HOST_NAME_IN_CERTIFICATE,
       connectionTimeout: process.env.CONNECTION_TIMEOUT
         ? parseInt(process.env.CONNECTION_TIMEOUT, 10)
         : 30,
@@ -357,15 +361,20 @@ export class EnvironmentManager {
         throw new Error(`Environment '${env.name}' requires username and password for SQL auth`);
       }
 
+      const sqlOptions: Record<string, any> = {
+        encrypt: env.encrypt ?? false,
+        trustServerCertificate: env.trustServerCertificate ?? false,
+      };
+      if (env.hostNameInCertificate) {
+        sqlOptions.serverName = env.hostNameInCertificate;
+      }
+
       return {
         config: {
           ...baseConfig,
           user: env.username,
           password: env.password,
-          options: {
-            encrypt: false,
-            trustServerCertificate: env.trustServerCertificate ?? false,
-          },
+          options: sqlOptions,
         },
       };
     }
@@ -389,13 +398,18 @@ export class EnvironmentManager {
         ntlmUser = ntlmUser.substring(backslashIndex + 1);
       }
 
+      const winOptions: Record<string, any> = {
+        encrypt: env.encrypt ?? false,
+        trustServerCertificate: env.trustServerCertificate ?? false,
+      };
+      if (env.hostNameInCertificate) {
+        winOptions.cryptoCredentialsDetails = { servername: env.hostNameInCertificate };
+      }
+
       return {
         config: {
           ...baseConfig,
-          options: {
-            encrypt: false,
-            trustServerCertificate: env.trustServerCertificate ?? false,
-          },
+          options: winOptions,
           authentication: {
             type: "ntlm",
             options: {
